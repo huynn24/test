@@ -1,0 +1,147 @@
+-- Tính LTV3, LTV4, ARPU, ARPPU , retention rate 1, retention rate 3 
+
+drop table if exists analytics.user_src ;
+create table analytics.user_src as 
+select * from ( 
+select 
+    advertising_id, 
+    upper(platform) as platform, 
+    country, 
+    -- case 
+    --     when media_source is null then 'organic' 
+    --     else media_source
+    -- end as media_source, 
+    event_date, 
+    row_number() over(partition by advertising_id order by event_date desc) rn 
+from summoners_era.bigquery_first_open 
+where event_date >  '2021-04-01' 
+and app_id in ('com.fansipan.summoners.era.idle', 'id1501819108')
+) t  
+where rn = 1 
+
+;
+
+select 
+ue.platform, 
+ue.country_code,
+ue.media_source,
+us.event_date,
+sum(if(datediff(ue.event_date, us.event_date) between 0 and 3, 1, 0)) as user3,
+sum(if(datediff(ue.event_date, us.event_date) between 0 and 7, 1, 0)) as user7,
+sum(if(datediff(ue.event_date, us.event_date) between 0 and 3, revenue, 0)) as rev3,
+sum(if(datediff(ue.event_date, us.event_date) between 0 and 7, revenue, 0)) as rev7, 
+sum(if(datediff(ue.event_date, us.event_date) >= 1, 1, 0)) / count(distinct us.advertising_id) ret1,
+sum(if(datediff(ue.event_date, us.event_date) >= 3, 1, 0)) / count(distinct us.advertising_id) ret3, 
+sum(revenue)/count(distinct us.advertising_id) arpu ,
+sum(revenue)/count(distinct (if(iap_rev > 0 , us.advertising_id, null))) arppu
+from 
+    (select  
+    advertising_id, event_date 
+    from analytics.user_src 
+    where 1=1 
+    and event_date between '2021-05-01' and '2021-06-20'
+    -- group by advertising_id 
+    ) us
+left join 
+    (select  
+    advertising_id, max(event_date) event_date
+    from summoners_era.bigquery_user_engagement 
+    where 1=1 
+    and event_date between '2021-05-01' and '2021-05-30'
+    group by advertising_id 
+    ) ue  on us.advertising_id = ue.advertising_id  
+left join
+    (select advertising_id, event_date, sum(iap_rev) + sum(ads_rev) as revenue , sum(iap_rev) iap_rev
+    from
+        (
+            (
+            select 
+            advertising_id, event_date, sum(event_value_in_usd) iap_rev, 0 as ads_rev
+            from summoners_era.bigquery_in_app_purchase
+            where app_id = 'com.fansipan.summoners.era.idle'
+            and event_date between '2021-05-01' and '2021-05-30'
+            group by advertising_id, event_date
+            )
+            union all
+            (
+            select advertising_id, event_date, 0 as iap_rev, sum(revenue) ads_rev
+            from summoners_era.iron_source_ad_revenue_report 
+            where app_id = 'com.fansipan.summoners.era.idle'
+            and event_date between '2021-05-01' and '2021-05-30'
+            group by advertising_id, event_date)
+        ) x
+    group by advertising_id, event_date) b
+    on us.advertising_id = b.advertising_id and us.event_date = b.event_date
+where 1=1 
+group by us.event_date 
+
+
+-- Thời gian trung bình user từ lúc chơi (thời gian chơi game) đến lúc mua hàng trong 7 ngày đầu và tính  10 gói first purchase được user mua nhiều nhất (xét trong 7 ngày đầu chơi)
+
+
+with purchase as ( 
+    select  
+    us.advertising_id, 
+    zp.product, 
+    zp.value,
+    us.event_date ,
+    zp.event_date, 
+    (unix_timestamp(cast(zp.event_date as timestamp) ) -  unix_timestamp(cast(us.event_date as timestamp) ))/86400 
+    from analytics.user_src us 
+    inner join 
+    ( 
+        select 
+        advertising_id,
+        case 
+            when product_id not regexp ('SE0|SE1|SE2') then regexp_extract(product_id, 'era.(.*)', 1 ) 
+            else product_id 
+        end as product 
+        ,event_date
+        ,value
+        ,row_number() over(partition by zp.advertising_id order by event_date asc ) rn 
+        from summoners_era.zitga_purchase zp 
+        where event_date between '2021-05-15' and '2021-05-20'
+        and app_id = 'com.fansipan.summoners.era.idle'
+        and zp.advertising_id not in  (select advertising_id from summoners_era.hungds_user_filter) 
+    )  zp on zp.advertising_id = us.advertising_id and zp.rn = 1 
+    where 1=1 
+    and (unix_timestamp(cast(zp.event_date as timestamp) ) -  unix_timestamp(cast(us.event_date as timestamp) ))/86400   between 0 and  7 
+) 
+
+select 
+product,
+event_date, 
+count(1) , 
+sum(value) 
+from purchase 
+group by product , event_date 
+
+
+
+-- Tính số gói tháng 
+select 
+avg(so_pack)
+from 
+(
+    select 
+    count(1) so_pack,
+    zp.advertising_id
+    from summoners_era.zitga_purchase zp 
+    where 1=1 
+	and event_date between '2021-05-01' and '2021-05-30'
+    and app_id = 'com.fansipan.summoners.era.idle'
+    and zp.product_id in 
+    (
+    'com.fansipan.summoners.era.idle_monthly_package_1'
+    ,'com.fansipan.summoners.era.idle_monthly_package_2'
+    ,'com.fansipan.summoners.era.idle_monthly_package_3'
+    ,'com.fansipan.summoners.era.idle_monthly_package_4'
+    ,'com.fansipan.summoners.era.idle_monthly_package_5'
+    ,'com.fansipan.summoners.era.idle_monthly_package_6'
+    ,'SE033'
+    ,'SE034'
+    ,'SE035'
+    )
+    and zp.advertising_id not in (select advertising_id from summoners_era.hungds_user_filter) 
+    group by zp.advertising_id 
+) t 
